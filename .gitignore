@@ -47,3 +47,12 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Large data files (>20MB)
+AlleghenyCounty_Parcels/AlleghenyCounty_Parcels202510.dbf
+AlleghenyCounty_Parcels/AlleghenyCounty_Parcels202510.shp
+mckeesport_parcel_map.html
+
+# Large data folders
+County Assessor Data/
+Parcel_Ownership_Dev_Districts/

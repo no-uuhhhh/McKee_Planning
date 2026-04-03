@@ -1,0 +1,400 @@
+---
+title: "McKeesport Parcel Lookup"
+format:
+  html:
+    self-contained: true
+    page-layout: full
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{css}
+body {
+  margin: 0 auto;
+  padding: 0 1.5rem 3rem;
+  font-family: system-ui, sans-serif;
+}
+h1 { margin-bottom: 0.25rem; }
+.subtitle {
+  color: #555;
+  font-size: 0.95rem;
+  margin-bottom: 1.25rem;
+}
+.map-wrapper {
+  width: 100%;
+  margin-bottom: 2rem;
+}
+/* Landscape map: constrained to body width, no horizontal scroll */
+.leaflet-container {
+  width:  100% !important;
+  height: min(calc(100vw / 1.6), calc(100vh - 6rem)) !important;
+  display: block;
+  margin: 0 auto;
+}
+.notes-section {
+  background: #f8f8f8;
+  border-left: 4px solid #1a3a6b;
+  padding: 1rem 1.5rem;
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.notes-section h2 { margin-top: 0; font-size: 1.1rem; }
+.notes-section h3 { font-size: 0.95rem; margin-top: 1.2rem; margin-bottom: 0.25rem; color: #1a3a6b; }
+```
+
+::: {.subtitle}
+Interactive parcel lookup for McKeesport, PA. Hover over any parcel to see ownership type, owner name, use, assessed value, and sale history. Data: Allegheny County Assessor, October 2025.
+:::
+
+```{r setup}
+library(sf)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(leaflet)
+library(htmltools)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+shp_path   <- "AlleghenyCounty_Parcels/AlleghenyCounty_Parcels202510.shp"
+excel_path <- "County Assessor Data/1_AC Property Assessments_20251001.xlsx"
+
+# ── McKeesport center ──────────────────────────────────────────────────────────
+center_lat <- 40.3425
+center_lon <- -79.8491
+```
+
+```{r data}
+# Read all McKeesport wards (MUNICODE 401–412) via SQL filter
+parcels_geom <- st_read(
+  shp_path,
+  query = "SELECT * FROM \"AlleghenyCounty_Parcels202510\" WHERE MUNICODE BETWEEN 401 AND 412",
+  quiet = TRUE
+) |>
+  st_transform(4326)
+
+# Read County Assessor Excel — primary source (contains PROPERTYOWNER)
+col_keep <- c(
+  "PARID", "PROPERTYOWNER", "PROPERTYHOUSENUM", "PROPERTYADDRESS",
+  "MUNICODE", "TAXCODE", "TAXDESC", "CLASS", "CLASSDESC", "USECODE", "USEDESC",
+  "LOTAREA", "HOMESTEADFLAG",
+  "SALEDATE", "SALEPRICE", "SALECODE", "SALEDESC",
+  "PREVSALEDATE", "PREVSALEPRICE", "PREVSALEDATE2", "PREVSALEPRICE2",
+  "COUNTYLAND", "COUNTYBUILDING", "COUNTYTOTAL",
+  "FAIRMARKETLAND", "FAIRMARKETBUILDING", "FAIRMARKETTOTAL",
+  "STYLEDESC", "YEARBLT", "CONDITIONDESC", "GRADEDESC",
+  "BEDROOMS", "FULLBATHS", "FINISHEDLIVINGAREA",
+  "DEEDBOOK", "DEEDPAGE", "STYLE"
+)
+
+assessments <- read_xlsx(excel_path) |>
+  select(all_of(col_keep)) |>
+  filter(MUNICODE %in% 401:412) |>
+  mutate(across(where(is.character), str_trim)) |>
+  rename(PIN = PARID)
+
+# Assign sequential IDs to unassessed polygons before joining
+parcels_geom <- parcels_geom |>
+  mutate(PIN = if_else(
+    PIN == "NOT ASSESSED",
+    sprintf("NA-%04d", cumsum(PIN == "NOT ASSESSED")),
+    PIN
+  ))
+
+# Join geometry + attributes on PIN (left join keeps all geometry rows)
+parcels <- parcels_geom |>
+  left_join(assessments, by = "PIN")
+```
+
+```{r labels}
+# ── Helper formatters ──────────────────────────────────────────────────────────
+fmt_dollar <- function(x) {
+  ifelse(is.na(x) | x == 0, "\u2014",
+    paste0("$", formatC(as.numeric(x), format = "f", digits = 0, big.mark = ",")))
+}
+
+fmt_date <- function(x) {
+  ifelse(is.na(x) | str_trim(x) == "", "\u2014", str_trim(x))
+}
+
+# ── Ownership type classifier (translated from Own_Type_Final.py) ──────────────
+classify_owner <- function(owner, taxdesc) {
+  o <- toupper(coalesce(owner, ""))
+  t <- toupper(coalesce(taxdesc, ""))
+
+  # Rule 1: PURTA
+  if (startsWith(t, "12 - PUBLIC UTILITY REALTY TAX")) return("Utilities (PURTA)")
+
+  # Rule 2: Churches / religious — always Institution
+  church_kw <- c("CHURCH", "PARISH", "PRESBYTERIAN", "BAPTIST", "CATHOLIC", "LUTHERAN",
+                 "EPISCOPAL", "METHODIST", "TEMPLE", "SYNAGOGUE", "MOSQUE", "DIOCESE",
+                 "MINISTR", "MISSION", "CONGREGATION")
+  if (any(str_detect(o, fixed(church_kw)))) return("Institution")
+
+  # Rule 3: City of McKeesport entities
+  if (str_detect(o, fixed("CITY OF MCKEESPORT")) ||
+      str_detect(o, fixed("CITY OF MC KEESPORT")) ||
+      (str_detect(o, fixed("MCKEESPORT")) && str_detect(o, fixed("REDEVELOPMENT AUTHORITY"))) ||
+      (str_detect(o, fixed("MCKEESPORT")) && str_detect(o, fixed("PARKING AUTHORITY"))) ||
+      (str_detect(o, fixed("MCKEESPORT")) && str_detect(o, fixed("HOUSING AUTHORITY")))) {
+    return("City")
+  }
+
+  # Rule 4: County entities
+  if (str_detect(o, fixed("ALLEGHENY COUNTY")) || str_detect(o, fixed("COUNTY OF "))) {
+    return("County")
+  }
+
+  # Rule 5: Tax-exempt → Institution
+  if (t == "10 - EXEMPT") return("Institution")
+
+  # Rule 6: False positive patterns (suppress institution keyword check)
+  fp <- c("HOSPITALITY CORP", " LLC", " LP", " INC", "INVESTMENT", "RENTAL")
+  has_fp <- any(str_detect(o, fixed(fp)))
+
+  # Rule 7: Federal — Veterans Affairs → Institution; other Secretary → Other Public
+  if (str_detect(o, fixed("SECRETARY OF VETERANS"))) return("Institution")
+  if (str_detect(o, fixed("SECRETARY OF"))) return("Other Public")
+
+  # Rule 8: Other nonprofits / charitable institutions (if no false positive)
+  inst_kw <- c("FOUNDATION", "CHARITABLE", "COMMUNITY SERVICES",
+               "MON YOUGH COMMUNITY SERVICES", "MON-YOUGH COMMUNITY SERVICES",
+               "HOSPITAL", "YOUNG MENS CHRISTIAN", "YMCA", "YWCA",
+               "SALVATION ARMY", "LODGE", "VETERANS", "WELFARE ASSOCIATION",
+               "NONPROFIT", "NON-PROFIT", "NON PROFIT")
+  if (!has_fp && any(str_detect(o, fixed(inst_kw)))) return("Institution")
+
+  # Rule 9: Other public entities
+  pub_kw <- c("AUTHORITY", "SCHOOL DISTRICT", "BOROUGH OF", "TOWNSHIP OF",
+              "COMMONWEALTH OF", "UNITED STATES", "US GOVT", "U S GOVERNMENT",
+              "PENNSYLVANIA TURNPIKE", "PORT AUTHORITY")
+  if (any(str_detect(o, fixed(pub_kw)))) return("Other Public")
+
+  # Rule 10: Private (fallback)
+  "Private"
+}
+
+# Vectorize over all parcels
+parcels <- parcels |>
+  mutate(own_type = mapply(classify_owner, PROPERTYOWNER, TAXDESC)) |>
+  mutate(
+    # Set owner name for unmatched polygons
+    PROPERTYOWNER = if_else(startsWith(PIN, "NA-"), "NOT ASSESSED", PROPERTYOWNER),
+    # Override ownership type for specific parcels
+    own_type      = if_else(PIN == "NA-0010", "City", own_type)
+  )
+
+# ── Color by ownership type ────────────────────────────────────────────────────
+own_colors <- c(
+  "Private"           = "#4a90d9",  # blue
+  "City"              = "#e8890c",  # orange
+  "County"            = "#7b1fa2",  # purple
+  "Institution"       = "#2e7d32",  # green
+  "Other Public"      = "#b0bec5",  # light slate
+  "Utilities (PURTA)" = "#78909c"   # slate
+)
+
+# ── Build hover label HTML ─────────────────────────────────────────────────────
+parcels <- parcels |>
+  mutate(
+    fill_color   = unname(coalesce(own_colors[own_type], "#78909c")),
+    addr_str     = str_trim(paste(
+      coalesce(as.character(PROPERTYHOUSENUM), ""),
+      coalesce(PROPERTYADDRESS, "")
+    )),
+    label_html = paste0(
+      "<div style='font-family:system-ui,sans-serif;font-size:12px;line-height:1.5;",
+      "max-width:300px;word-wrap:break-word;overflow-wrap:break-word'>",
+      "<b style='font-size:14px'>", addr_str, "</b><br>",
+      "<span style='color:#888;font-size:11px'>PIN: ", PIN, "</span>",
+
+      "<hr style='margin:6px 0;border:none;border-top:1px solid #eee'>",
+      "<b>Owner</b><br>",
+      coalesce(PROPERTYOWNER, "\u2014"), "<br>",
+      "Ownership type: <b>", own_type, "</b><br>",
+      "Tax status: ", coalesce(TAXDESC, "\u2014"),
+
+      "<hr style='margin:6px 0;border:none;border-top:1px solid #eee'>",
+      "<b>Classification</b><br>",
+      "Class: ", coalesce(CLASSDESC, "\u2014"), "<br>",
+      "Use: ", coalesce(USEDESC, "\u2014"),
+
+      "<hr style='margin:6px 0;border:none;border-top:1px solid #eee'>",
+      "<b>Assessed Value</b><br>",
+      "County total: ", fmt_dollar(COUNTYTOTAL), "<br>",
+      "Fair market: <b>", fmt_dollar(FAIRMARKETTOTAL), "</b><br>",
+      "Land: ", fmt_dollar(FAIRMARKETLAND), "<br>",
+      "Building: ", fmt_dollar(FAIRMARKETBUILDING),
+
+      "<hr style='margin:6px 0;border:none;border-top:1px solid #eee'>",
+      "<b>Sale History</b><br>",
+      "Last sale: ", fmt_date(SALEDATE), " &mdash; ", fmt_dollar(SALEPRICE),
+      ifelse(!is.na(SALEDESC) & SALEDESC != "", paste0(" <i>(", SALEDESC, ")</i>"), ""), "<br>",
+      "Prior: ", fmt_date(PREVSALEDATE), " &mdash; ", fmt_dollar(PREVSALEPRICE), "<br>",
+      "2nd prior: ", fmt_date(PREVSALEDATE2), " &mdash; ", fmt_dollar(PREVSALEPRICE2),
+
+      "</div>"
+    )
+  )
+```
+
+```{r map}
+m <- leaflet(
+  options = leafletOptions(
+    minZoom   = 13,
+    maxZoom   = 19,
+    maxBounds = list(
+      list(center_lat - 0.06, center_lon - 0.09),
+      list(center_lat + 0.06, center_lon + 0.09)
+    )
+  )
+) |>
+
+  # ── Basemaps ────────────────────────────────────────────────────────────────
+  addProviderTiles("CartoDB.Positron",  group = "Light (default)") |>
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") |>
+
+  # ── Base parcel layer (grey, always on, carries tooltips + popups) ───────────
+  addPolygons(
+    data        = parcels,
+    fillColor   = "#cccccc",
+    fillOpacity = 0.4,
+    color       = "#555",
+    weight      = 0.7,
+    opacity     = 0.8,
+    label        = ~lapply(label_html, HTML),
+    labelOptions = labelOptions(
+      style     = list("font-size" = "12px", "max-width" = "300px"),
+      sticky    = FALSE,
+      direction = "auto"
+    ),
+    popup        = ~label_html,
+    popupOptions = popupOptions(maxWidth = 320, closeOnClick = FALSE),
+    group = "Parcels"
+  ) |>
+
+  # ── Ownership type color layer (toggleable, hidden by default) ───────────────
+  addPolygons(
+    data        = parcels,
+    fillColor   = ~fill_color,
+    fillOpacity = 0.55,
+    color       = "#333",
+    weight      = 0.7,
+    opacity     = 0.8,
+    label        = ~lapply(label_html, HTML),
+    labelOptions = labelOptions(
+      style     = list("font-size" = "12px", "max-width" = "300px"),
+      sticky    = FALSE,
+      direction = "auto"
+    ),
+    popup        = ~label_html,
+    popupOptions = popupOptions(maxWidth = 320, closeOnClick = FALSE),
+    group = "Ownership Type"
+  ) |>
+
+  # ── Legend ──────────────────────────────────────────────────────────────────
+  addLegend(
+    position = "bottomright",
+    colors   = c("#4a90d9", "#e8890c", "#7b1fa2", "#2e7d32", "#b0bec5", "#78909c"),
+    labels   = c("Private", "City", "County", "Institution", "Other Public",
+                 "Utilities (PURTA)"),
+    title    = "Ownership Type<br><small>faded = tax-exempt</small>",
+    opacity  = 0.85,
+    group    = "Ownership Type"
+  ) |>
+
+  # ── Layer control ───────────────────────────────────────────────────────────
+  addLayersControl(
+    baseGroups    = c("Light (default)", "Satellite"),
+    overlayGroups = c("Parcels", "Ownership Type"),
+    position      = "topright",
+    options       = layersControlOptions(collapsed = FALSE)
+  ) |>
+
+  hideGroup("Ownership Type") |>
+
+  addScaleBar(position = "bottomleft") |>
+
+  fitBounds(
+    lng1 = center_lon - 0.03, lat1 = center_lat - 0.02,
+    lng2 = center_lon + 0.03, lat2 = center_lat + 0.02
+  ) |>
+
+  # ── Legend toggle + layer control section labels ─────────────────────────────
+  htmlwidgets::onRender("
+    function(el, x) {
+      var map = this;
+
+      // Hide/show legend with Ownership Type layer toggle
+      map.on('overlayremove', function(e) {
+        if (e.name === 'Ownership Type') {
+          el.querySelectorAll('.leaflet-bottom.leaflet-right .info').forEach(function(l) {
+            l.style.display = 'none';
+          });
+        }
+      });
+      map.on('overlayadd', function(e) {
+        if (e.name === 'Ownership Type') {
+          el.querySelectorAll('.leaflet-bottom.leaflet-right .info').forEach(function(l) {
+            l.style.display = '';
+          });
+        }
+      });
+
+      // Inject section labels into the layer control
+      var ctrl = el.querySelector('.leaflet-control-layers');
+      if (ctrl) {
+        var baseDiv = ctrl.querySelector('.leaflet-control-layers-base');
+        if (baseDiv) {
+          var baseLabel = document.createElement('div');
+          baseLabel.style.cssText = 'font-weight:600;font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px;padding-top:2px';
+          baseLabel.textContent = 'Basemap Style';
+          baseDiv.insertBefore(baseLabel, baseDiv.firstChild);
+        }
+        var overlayDiv = ctrl.querySelector('.leaflet-control-layers-overlays');
+        if (overlayDiv) {
+          var overlayLabel = document.createElement('div');
+          overlayLabel.style.cssText = 'font-weight:600;font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px;margin-top:6px;padding-top:4px;border-top:1px solid #ddd';
+          overlayLabel.textContent = 'Layer Data';
+          overlayDiv.insertBefore(overlayLabel, overlayDiv.firstChild);
+        }
+      }
+    }
+  ")
+
+div(class = "map-wrapper", m)
+```
+
+---
+
+::: {.notes-section}
+
+## Data Notes
+
+### Source & Currency
+Parcel boundaries from the Allegheny County Division of Computer Services GIS Group (October 2025). Assessment attributes from the Allegheny County Assessor file, also October 2025. Both datasets reflect the 2025 tax year assessment.
+
+### Field Definitions
+
+**Ownership Type** — Derived by applying keyword and tax-status rules to the property owner name and tax description:
+- **Private** — private individuals, LLCs, corporations, and partnerships
+- **City** — City of McKeesport and its authorities (Redevelopment, Housing, Parking)
+- **County** — Allegheny County entities
+- **Institution** — churches, nonprofits, hospitals, foundations, and other tax-exempt charitable organizations
+- **Other Public** — school districts, other municipalities, state/federal agencies, and other authorities
+- **Utilities (PURTA)** — public utility infrastructure subject to the Public Utility Realty Tax Act
+
+**Tax Status** — Taxable (T), Exempt (E), or PURTA (P). Exempt parcels are rendered at lower opacity on the map.
+
+**Fair Market Value** — The assessor's estimate of open-market value. Land and building components are shown separately.
+
+**County Total** — The assessed value used for county millage calculations. In Allegheny County, assessed value is set at a fixed percentage of fair market value based on a base year.
+
+**Sale History** — Up to three prior sale records: date, price, and sale type. A $0 price or "—" typically indicates a deed transfer, estate transfer, or other non-arm's-length transaction.
+
+### How to Use
+Hover over any parcel to see a detailed label. Zoom in for individual lot detail. Use the layer control (top right) to toggle between basemaps. The scale bar (bottom left) adjusts as you zoom.
+
+:::

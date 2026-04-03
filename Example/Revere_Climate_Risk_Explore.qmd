@@ -1,0 +1,696 @@
+---
+title: "Revere Climate Risk Explorer"
+format:
+  html:
+    self-contained: true
+    page-layout: full
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{css}
+body {
+  margin: 0 auto;
+  padding: 0 1.5rem 3rem;
+  font-family: system-ui, sans-serif;
+}
+h1 { margin-bottom: 0.25rem; }
+.subtitle {
+  color: #555;
+  font-size: 0.95rem;
+  margin-bottom: 1.25rem;
+}
+.map-wrapper {
+  width: 100%;
+  margin-bottom: 2rem;
+}
+/* Landscape map: constrained to body width, no horizontal scroll */
+.leaflet-container {
+  width:  100% !important;
+  height: min(calc(100vw / 1.6), calc(100vh - 6rem)) !important;
+  display: block;
+  margin: 0 auto;
+}
+.notes-section {
+  background: #f8f8f8;
+  border-left: 4px solid #1a3a6b;
+  padding: 1rem 1.5rem;
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.notes-section h2 { margin-top: 0; font-size: 1.1rem; }
+.notes-section h3 { font-size: 0.95rem; margin-top: 1.2rem; margin-bottom: 0.25rem; color: #1a3a6b; }
+```
+
+::: {.subtitle}
+Interactive flood risk and social vulnerability explorer — Revere, MA. Toggle layers using the control panel (top right). Hover over features for details.
+:::
+
+```{r setup}
+library(sf)
+library(terra)
+library(leaflet)
+library(leaflet.extras)
+library(tigris)
+library(dplyr)
+options(tigris_use_cache = TRUE)
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+data_dir <- file.path(here::here(), "..", "Data") |> normalizePath()
+
+# ── Study area ───────────────────────────────────────────────────────────────
+center_lat <- 42.419494
+center_lon <- -70.988194
+bbox_pad   <- 0.05   # ~3.5 mi buffer for data loading
+
+study_bbox <- st_bbox(
+  c(xmin = center_lon - bbox_pad, xmax = center_lon + bbox_pad,
+    ymin = center_lat - bbox_pad, ymax = center_lat + bbox_pad),
+  crs = st_crs(4326)
+)
+
+# terra extent (WGS84 degrees) for raster cropping
+study_ext <- ext(
+  center_lon - bbox_pad, center_lon + bbox_pad,
+  center_lat - bbox_pad, center_lat + bbox_pad
+)
+
+# MA State Plane (EPSG:26986) WKT for parcels wkt_filter
+study_wkt_masp <- study_bbox |>
+  st_as_sfc() |>
+  st_transform(26986) |>
+  st_as_text()
+
+# ── Default view: ~1 mile across ─────────────────────────────────────────────
+view_pad <- 0.0073
+```
+
+```{r fema}
+# ── FEMA FIRM flood zones ─────────────────────────────────────────────────────
+fema_path <- file.path(data_dir, "FEMA Flood Map", "25025C_20260121", "S_FLD_HAZ_AR.shp")
+fema_all  <- st_read(fema_path, quiet = TRUE) |>
+  st_transform(4326) |>
+  st_crop(study_bbox)
+
+fema_ae <- fema_all |> filter(FLD_ZONE == "AE")
+fema_ve <- fema_all |> filter(FLD_ZONE == "VE")
+fema_x  <- fema_all |> filter(grepl("^X", FLD_ZONE))
+```
+
+```{r noaa-slr}
+# ── NOAA Sea Level Rise (4 scenarios) ────────────────────────────────────────
+# Datum: MHHW (~1.5 ft above NAVD88 at Boston Harbor)
+noaa_path <- file.path(data_dir, "NOAA", "MA_slr_final_dist.gpkg")
+
+load_slr <- function(layer) {
+  st_read(noaa_path, layer = layer, quiet = TRUE) |>
+    st_transform(4326) |>
+    st_crop(study_bbox)
+}
+
+slr_1ft   <- load_slr("MA_slr_1_0ft")
+slr_3ft   <- load_slr("MA_slr_3_0ft")
+slr_3_5ft <- load_slr("MA_slr_3_5ft")
+slr_4ft   <- load_slr("MA_slr_4_0ft")
+slr_4_5ft <- load_slr("MA_slr_4_5ft")
+slr_5ft   <- load_slr("MA_slr_5_0ft")
+slr_5_5ft <- load_slr("MA_slr_5_5ft")
+slr_6ft   <- load_slr("MA_slr_6_0ft")
+```
+
+```{r mcfrm-rasters}
+# ── MC-FRM 2050 rasters (NAD83/MA Mainland → WGS84) ──────────────────────────
+# Mask NoData (9999), project to EPSG:4326 for leaflet
+
+load_mcfrm <- function(rel_path, to_feet = FALSE) {
+  r <- rast(file.path(data_dir, "Woods Hole", "Level 1", rel_path))
+  r <- classify(r, cbind(9999, NA))
+  if (to_feet) r <- r * 3.28084   # metres → feet (100% exact conversion)
+  project(r, "EPSG:4326", method = "near")
+}
+
+r_prob <- load_mcfrm("MC_FRM_2050_Probability_V09_Revere/REVERE_2050_Prob_V09.tif")
+r_d1   <- load_mcfrm("MC_FRM_2050_D1_V09_Revere/REVERE_2050_D1_V09.tif",     to_feet = TRUE)
+r_dpt1 <- load_mcfrm("MC_FRM_2050_Dpt1_V09_Revere/REVERE_2050_Dpt1_V09.tif", to_feet = TRUE)
+r_dpt5 <- load_mcfrm("MC_FRM_2050_Dpt5_V09_Revere/REVERE_2050_Dpt5_V09.tif", to_feet = TRUE)
+
+# Cap legend domain at 90th percentile — filters model edge artifacts (max ~130 ft)
+# Depth layers in feet; 90th pctile ≈ 18–24 ft, reflecting realistic coastal flood depths
+p90 <- function(r) quantile(values(r, na.rm = TRUE), 0.90, na.rm = TRUE)
+d1_range   <- c(as.vector(minmax(r_d1))[1],   p90(r_d1))
+dpt1_range <- c(as.vector(minmax(r_dpt1))[1], p90(r_dpt1))
+dpt5_range <- c(as.vector(minmax(r_dpt5))[1], p90(r_dpt5))
+```
+
+```{r slosh-rasters}
+# ── SLOSH storm surge (crop national rasters to study area) ──────────────────
+# EPSG:4269 (≈WGS84); values = inundation depth in feet above ground
+# Cat 5 MOM does not cover New England — omitted
+
+load_slosh <- function(cat) {
+  fname <- paste0("us_Category", cat, "_MOM_Inundation_HIGH.tif")
+  r  <- rast(file.path(data_dir, "SLOSH", fname))
+  re <- as.vector(ext(r))
+  se <- as.vector(study_ext)
+  if (se[1] > re[2] || se[2] < re[1] || se[3] > re[4] || se[4] < re[3]) return(NULL)
+  crop_ext <- ext(max(se[1],re[1]), min(se[2],re[2]), max(se[3],re[3]), min(se[4],re[4]))
+  r <- crop(r, crop_ext)
+  classify(r, cbind(0, NA))
+}
+
+slosh_1 <- load_slosh(1)
+slosh_2 <- load_slosh(2)
+slosh_3 <- load_slosh(3)
+slosh_4 <- load_slosh(4)
+
+# Fixed domain 0–21 ft across all categories (Cat 4 max) for a consistent shared legend
+slosh_domain <- c(0, 21)
+```
+
+```{r wave-overtopping}
+# ── MC-FRM Wave Overtopping Zones (Type 9997) ────────────────────────────────
+# Areas where flooding is driven by waves overtopping coastal barriers.
+# D1 variant = 1% annual chance event. One polygon per time horizon.
+
+load_woz <- function(year) {
+  p <- file.path(data_dir, "Woods Hole", "Level 2", "Region_29",
+                 as.character(year),
+                 paste0("Region29_", year, "_D1_Hatch_Zones.shp"))
+  st_read(p, quiet = TRUE) |> st_transform(4326)
+}
+
+woz_2030 <- load_woz(2030)
+woz_2050 <- load_woz(2050)
+woz_2070 <- load_woz(2070)
+```
+
+```{r svi}
+# ── CDC Social Vulnerability Index (2022, census tracts) ──────────────────────
+svi <- st_read(
+  file.path(data_dir, "CDC SVI", "SVI2022_MASSACHUSETTS_tract.gdb"),
+  layer = "SVI2022_MASSACHUSETTS_tract",
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  st_crop(study_bbox) |>
+  select(FIPS, RPL_THEMES, RPL_THEME1, RPL_THEME2, RPL_THEME3, RPL_THEME4,
+         E_TOTPOP, LOCATION)
+
+svi_pal <- colorNumeric(
+  palette = c("#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"),
+  domain  = c(0, 1),
+  na.color = "transparent"
+)
+```
+
+```{r multiple-loss}
+# ── FEMA NFIP Repetitive Loss — block group choropleth ────────────────────────
+# Raw coords are privacy-rounded to 1 decimal (all show 42.4, -71.0).
+# Use censusBlockGroup GEOID (12-char FIPS) to aggregate and join to tigris geometry.
+
+ml_raw <- read.csv(
+  file.path(data_dir, "FEMA Multiple Loss", "NfipMultipleLossProperties.csv")
+)
+
+ml_counts <- ml_raw |>
+  filter(stateAbbreviation == "MA", reportedCity == "REVERE",
+         !is.na(censusBlockGroup), censusBlockGroup != "") |>
+  mutate(censusBlockGroup = as.character(censusBlockGroup)) |>
+  count(censusBlockGroup, name = "rl_count")
+
+# Pull Suffolk County block group boundaries from Census TIGER (cached after first run)
+bg_geom <- block_groups(state = "MA", county = "Suffolk", year = 2020,
+                         progress_bar = FALSE) |>
+  st_transform(4326) |>
+  select(GEOID, geometry)
+
+ml_bg <- bg_geom |>
+  inner_join(ml_counts, by = c("GEOID" = "censusBlockGroup"))
+
+ml_pal <- colorNumeric(
+  palette = c("#ffe082", "#ff8f00", "#e65100", "#b71c1c"),
+  domain  = ml_bg$rl_count,
+  na.color = "transparent"
+)
+```
+
+```{r parcels}
+# ── Tax parcels ───────────────────────────────────────────────────────────────
+# File CRS: NAD83/MA State Plane (EPSG:26986, metres).
+# wkt_filter must match file CRS — use study_wkt_masp (not WGS84).
+uc_lut_raw <- foreign::read.dbf(
+  file.path(data_dir, "Statewide Parcels SHP", "L3_UC_LUT.dbf")
+) |>
+  mutate(USE_CODE = as.character(USE_CODE)) |>
+  select(USE_CODE, USE_DESC, TOWN_ID)
+
+# Prefer statewide (TOWN_ID==0) descriptions; fall back to any town-specific row
+# for codes not present statewide (e.g. 1021 = Residential Condo, 111C/112C = apartment variants)
+uc_lut_statewide <- uc_lut_raw |> filter(TOWN_ID == 0) |>
+  distinct(USE_CODE, .keep_all = TRUE)
+uc_lut_fallback  <- uc_lut_raw |> filter(!USE_CODE %in% uc_lut_statewide$USE_CODE) |>
+  distinct(USE_CODE, .keep_all = TRUE)
+uc_lut <- bind_rows(uc_lut_statewide, uc_lut_fallback) |>
+  select(USE_CODE, USE_DESC)
+
+parcels_raw <- st_read(
+  file.path(data_dir, "Statewide Parcels SHP", "L3_TAXPAR_POLY_ASSESS_EAST.shp"),
+  wkt_filter = study_wkt_masp,
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  mutate(USE_CODE_chr = as.character(USE_CODE)) |>
+  left_join(uc_lut, by = c("USE_CODE_chr" = "USE_CODE"))
+
+# Multi-property owner: count parcels per owner name in study area
+owner_counts <- parcels_raw |>
+  st_drop_geometry() |>
+  filter(!is.na(OWNER1), OWNER1 != "") |>
+  count(OWNER1, name = "owner_parcel_count")
+
+# Owner-occupancy: normalize addresses to compare owner mailing address vs site address
+# SITE_ADDR has double spaces (e.g. "164  PARK AVE"); OWN_ADDR has single spaces
+normalize_addr <- function(x) toupper(trimws(gsub("\\s+", " ", x)))
+
+parcels <- parcels_raw |>
+  left_join(owner_counts, by = "OWNER1") |>
+  mutate(
+    is_vacant      = BLDG_VAL == 0 & BLD_AREA == 0,
+    is_city_owned  = USE_CODE_chr %in% c("930", "985") |
+                     grepl("CITY OF REVERE|CITY OF CHELSEA|MBTA|COMMONWEALTH|MASSPORT|MASS DOT|MASSDOT",
+                           OWNER1, ignore.case = TRUE),
+    is_owner_occ   = normalize_addr(OWN_ADDR) == normalize_addr(SITE_ADDR) &
+                     toupper(trimws(OWN_CITY)) == toupper(trimws(CITY)),
+    multi_owner    = !is.na(owner_parcel_count) & owner_parcel_count > 1,
+    label_text = paste0(
+      "<b>", SITE_ADDR, "</b><br>",
+      "Owner: ", OWNER1,
+      ifelse(multi_owner, paste0(" <i>(", owner_parcel_count, " properties in study area)</i>"), ""), "<br>",
+      "Owner-occupied: ", ifelse(is_owner_occ, "Yes", "No*"), "<br>",
+      "Vacancy: ", ifelse(is_vacant, "<b>Likely vacant (unimproved)</b>", "Occupied / improved"), "<br>",
+      "City-owned: ", ifelse(is_city_owned, "Yes", "No"), "<br>",
+      "Total assessed value: $", formatC(TOTAL_VAL, format = "f", digits = 0, big.mark = ","), "<br>",
+      "Land: $", formatC(LAND_VAL, format = "f", digits = 0, big.mark = ","),
+      " | Bldg: $", formatC(BLDG_VAL, format = "f", digits = 0, big.mark = ","), "<br>",
+      "Use: ", ifelse(is.na(USE_DESC), as.character(USE_CODE), USE_DESC), "<br>",
+      "Lot: ", LOT_SIZE, " ac | Built: ", ifelse(YEAR_BUILT == 0, "—", YEAR_BUILT),
+      " | Zone: ", ifelse(is.na(ZONING) | ZONING == "", "—", ZONING)
+    )
+  )
+
+# Sub-layer filtered datasets
+parcels_vacant <- parcels |> filter(is_vacant)
+parcels_city   <- parcels |> filter(is_city_owned)
+```
+
+```{r map}
+# ── Color palettes ────────────────────────────────────────────────────────────
+# All blue palettes start at second-lightest (#90caf9) or darker
+
+prob_pal <- colorNumeric(
+  palette = c("#90caf9", "#42a5f5", "#1565c0", "#003399"),
+  domain  = c(0, 1), na.color = "transparent"
+)
+depth_pal_d1 <- colorNumeric(
+  palette = c("#64b5f6", "#1e88e5", "#0d47a1", "#001a66"),
+  domain  = d1_range, na.color = "transparent"
+)
+depth_pal_dpt1 <- colorNumeric(
+  palette = c("#4fc3f7", "#0288d1", "#01579b", "#002244"),
+  domain  = dpt1_range, na.color = "transparent"
+)
+depth_pal_dpt5 <- colorNumeric(
+  palette = c("#4dd0e1", "#00838f", "#006064", "#002930"),
+  domain  = dpt5_range, na.color = "transparent"
+)
+slosh_pal <- colorNumeric(
+  palette = c("#7ec8f7", "#3a9de0", "#1565c0", "#002d6b"),
+  domain  = slosh_domain, na.color = "transparent"
+)
+
+# ── Group name vectors (for hideGroup + overlayGroups) ────────────────────────
+grp_fema   <- c("AE Zone (100-yr)", "VE Zone (coastal wave)", "X Zone (500-yr)")
+grp_slr    <- c("SLR 1 ft", "SLR 3 ft", "SLR 3.5 ft", "SLR 4 ft", "SLR 4.5 ft",
+                "SLR 5 ft", "SLR 5.5 ft", "SLR 6 ft")
+grp_mcfrm  <- c("2050 Flood Probability",
+                "2050 Inundation Extent (1% event, ≥1m depth)",
+                "2050 Flood Depth (1% annual chance)",
+                "2050 Flood Depth (5% annual chance)")
+grp_slosh  <- c("SLOSH Cat 1", "SLOSH Cat 2", "SLOSH Cat 3", "SLOSH Cat 4")
+grp_woz    <- c("Wave Overtopping Zone 2030",
+                "Wave Overtopping Zone 2050",
+                "Wave Overtopping Zone 2070")
+grp_equity <- c("CDC SVI", "FEMA Repetitive Loss (by block group)",
+                "Parcels", "Vacant Parcels", "City-Owned Parcels")
+
+all_groups <- c(grp_fema, grp_slr, grp_mcfrm, grp_slosh, grp_woz, grp_equity)
+
+# ── Build map ─────────────────────────────────────────────────────────────────
+m <- leaflet(
+  options = leafletOptions(
+    minZoom = 12, maxZoom = 20,
+    maxBounds = list(
+      list(center_lat - 0.09, center_lon - 0.14),
+      list(center_lat + 0.09, center_lon + 0.14)
+    )
+  )
+) |>
+
+  # ── Base tiles ───────────────────────────────────────────────────────────
+  addProviderTiles("CartoDB.Positron",    group = "Light (default)") |>
+  addProviderTiles("OpenStreetMap.Mapnik", group = "OpenStreetMap") |>
+  addProviderTiles("Esri.WorldImagery",   group = "Satellite") |>
+
+  # ── FEMA Flood Zones ──────────────────────────────────────────────────────
+  addPolygons(
+    data = fema_ae, group = "AE Zone (100-yr)",
+    fillColor = "#1a3a6b", fillOpacity = 0.45,
+    color = "#1a3a6b", weight = 0.5, opacity = 0.7,
+    label = ~paste("AE Zone — BFE:", STATIC_BFE, "ft NAVD88")
+  ) |>
+  addPolygons(
+    data = fema_ve, group = "VE Zone (coastal wave)",
+    fillColor = "#0d2b8c", fillOpacity = 0.5,
+    color = "#0d2b8c", weight = 0.5, opacity = 0.8,
+    label = ~paste("VE Zone — BFE:", STATIC_BFE, "ft NAVD88")
+  ) |>
+  addPolygons(
+    data = fema_x, group = "X Zone (500-yr)",
+    fillColor = "#5b9bd5", fillOpacity = 0.3,
+    color = "#4285c4", weight = 0.3, opacity = 0.5
+  ) |>
+
+  # ── NOAA Sea Level Rise ───────────────────────────────────────────────────
+  addPolygons(
+    data = slr_1ft,   group = "SLR 1 ft",
+    fillColor = "#b3e5fc", fillOpacity = 0.5, color = "#b3e5fc", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_3ft,   group = "SLR 3 ft",
+    fillColor = "#7ec8f7", fillOpacity = 0.5, color = "#7ec8f7", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_3_5ft, group = "SLR 3.5 ft",
+    fillColor = "#5ab4f0", fillOpacity = 0.5, color = "#5ab4f0", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_4ft,   group = "SLR 4 ft",
+    fillColor = "#3a9de0", fillOpacity = 0.5, color = "#3a9de0", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_4_5ft, group = "SLR 4.5 ft",
+    fillColor = "#2080c8", fillOpacity = 0.5, color = "#2080c8", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_5ft,   group = "SLR 5 ft",
+    fillColor = "#1565c0", fillOpacity = 0.5, color = "#1565c0", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_5_5ft, group = "SLR 5.5 ft",
+    fillColor = "#0d4fa0", fillOpacity = 0.5, color = "#0d4fa0", weight = 0.3
+  ) |>
+  addPolygons(
+    data = slr_6ft,   group = "SLR 6 ft",
+    fillColor = "#003f8a", fillOpacity = 0.55, color = "#003f8a", weight = 0.3
+  ) |>
+
+  # ── MC-FRM 2050 Rasters ───────────────────────────────────────────────────
+  addRasterImage(
+    r_prob, group = "2050 Flood Probability",
+    colors = prob_pal, opacity = 0.6, project = FALSE
+  ) |>
+  addRasterImage(
+    r_d1,   group = "2050 Inundation Extent (1% event, ≥1m depth)",
+    colors = depth_pal_d1, opacity = 0.6, project = FALSE
+  ) |>
+  addRasterImage(
+    r_dpt1, group = "2050 Flood Depth (1% annual chance)",
+    colors = depth_pal_dpt1, opacity = 0.6, project = FALSE
+  ) |>
+  addRasterImage(
+    r_dpt5, group = "2050 Flood Depth (5% annual chance)",
+    colors = depth_pal_dpt5, opacity = 0.6, project = FALSE
+  ) |>
+
+  # ── SLOSH Storm Surge ─────────────────────────────────────────────────────
+  addRasterImage(
+    slosh_1, group = "SLOSH Cat 1",
+    colors = slosh_pal, opacity = 0.55, project = TRUE
+  ) |>
+  addRasterImage(
+    slosh_2, group = "SLOSH Cat 2",
+    colors = slosh_pal, opacity = 0.55, project = TRUE
+  ) |>
+  addRasterImage(
+    slosh_3, group = "SLOSH Cat 3",
+    colors = slosh_pal, opacity = 0.55, project = TRUE
+  ) |>
+  addRasterImage(
+    slosh_4, group = "SLOSH Cat 4",
+    colors = slosh_pal, opacity = 0.55, project = TRUE
+  ) |>
+
+  # ── Wave Overtopping Zones ────────────────────────────────────────────────
+  addPolygons(
+    data = woz_2030, group = "Wave Overtopping Zone 2030",
+    fillColor = "#00838f", fillOpacity = 0.4, color = "#006064", weight = 1.2,
+    label = ~paste0("Wave Overtopping Zone (2030)")
+  ) |>
+  addPolygons(
+    data = woz_2050, group = "Wave Overtopping Zone 2050",
+    fillColor = "#00695c", fillOpacity = 0.45, color = "#004d40", weight = 1.2,
+    label = ~paste0("Wave Overtopping Zone (2050)")
+  ) |>
+  addPolygons(
+    data = woz_2070, group = "Wave Overtopping Zone 2070",
+    fillColor = "#004d40", fillOpacity = 0.5, color = "#00251a", weight = 1.2,
+    label = ~paste0("Wave Overtopping Zone (2070)")
+  ) |>
+
+  # ── CDC SVI ───────────────────────────────────────────────────────────────
+  addPolygons(
+    data = svi, group = "CDC SVI",
+    fillColor = ~svi_pal(RPL_THEMES), fillOpacity = 0.6,
+    color = "#888", weight = 0.5,
+    label = ~paste0("SVI: ", round(RPL_THEMES * 100), "th pctile | ", LOCATION)
+  ) |>
+
+  # ── FEMA Repetitive Loss choropleth ──────────────────────────────────────
+  addPolygons(
+    data = ml_bg, group = "FEMA Repetitive Loss (by block group)",
+    fillColor = ~ml_pal(rl_count), fillOpacity = 0.65,
+    color = "#bf360c", weight = 0.8,
+    label = ~paste0(rl_count, " repetitive loss properties (block group)")
+  ) |>
+
+  # ── Parcels ───────────────────────────────────────────────────────────────
+  addPolygons(
+    data = parcels, group = "Parcels",
+    fillColor = "transparent", fillOpacity = 0,
+    color = "#616161", weight = 0.8, opacity = 0.6,
+    label = ~lapply(label_text, htmltools::HTML),
+    labelOptions = labelOptions(
+      style = list("font-size" = "12px", "max-width" = "280px"),
+      sticky = FALSE, direction = "auto"
+    )
+  ) |>
+  addPolygons(
+    data = parcels_vacant, group = "Vacant Parcels",
+    fillColor = "#ff8f00", fillOpacity = 0.45,
+    color = "#e65100", weight = 0.8, opacity = 0.7,
+    label = ~lapply(label_text, htmltools::HTML),
+    labelOptions = labelOptions(
+      style = list("font-size" = "12px", "max-width" = "280px"),
+      sticky = FALSE, direction = "auto"
+    )
+  ) |>
+  addPolygons(
+    data = parcels_city, group = "City-Owned Parcels",
+    fillColor = "#7b1fa2", fillOpacity = 0.45,
+    color = "#4a148c", weight = 0.8, opacity = 0.7,
+    label = ~lapply(label_text, htmltools::HTML),
+    labelOptions = labelOptions(
+      style = list("font-size" = "12px", "max-width" = "280px"),
+      sticky = FALSE, direction = "auto"
+    )
+  ) |>
+
+  # ── Legends — use native group= param so leaflet binding auto-toggles them ──
+  addLegend(
+    position = "bottomright",
+    pal = prob_pal, values = c(0, 1),
+    title = "2050 Flood Probability<br><small>annual chance</small>",
+    labFormat = labelFormat(suffix = "%", transform = function(x) round(x * 100)),
+    opacity = 0.85, group = "2050 Flood Probability"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = depth_pal_d1, values = d1_range,
+    title = "Inundation Depth (ft)<br><small>1% event, ≥1m threshold</small>",
+    opacity = 0.85, group = "2050 Inundation Extent (1% event, ≥1m depth)"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = depth_pal_dpt1, values = dpt1_range,
+    title = "Flood Depth (ft)<br><small>1% annual chance</small>",
+    opacity = 0.85, group = "2050 Flood Depth (1% annual chance)"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = depth_pal_dpt5, values = dpt5_range,
+    title = "Flood Depth (ft)<br><small>5% annual chance</small>",
+    opacity = 0.85, group = "2050 Flood Depth (5% annual chance)"
+  ) |>
+  # SLOSH: one legend per group — binding deduplicates by showing/hiding per toggle
+  addLegend(
+    position = "bottomright",
+    pal = slosh_pal, values = slosh_domain,
+    title = "Surge Depth (ft)<br><small>SLOSH MOM</small>",
+    opacity = 0.85, group = "SLOSH Cat 1"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = slosh_pal, values = slosh_domain,
+    title = "Surge Depth (ft)<br><small>SLOSH MOM</small>",
+    opacity = 0.85, group = "SLOSH Cat 2"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = slosh_pal, values = slosh_domain,
+    title = "Surge Depth (ft)<br><small>SLOSH MOM</small>",
+    opacity = 0.85, group = "SLOSH Cat 3"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = slosh_pal, values = slosh_domain,
+    title = "Surge Depth (ft)<br><small>SLOSH MOM</small>",
+    opacity = 0.85, group = "SLOSH Cat 4"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = svi_pal, values = c(0, 0.25, 0.5, 0.75, 1),
+    title = "CDC SVI<br><small>vulnerability percentile</small>",
+    labFormat = labelFormat(suffix = "th pctile",
+                            transform = function(x) as.integer(round(x * 100))),
+    opacity = 0.85, group = "CDC SVI"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = ml_pal, values = ml_bg$rl_count,
+    title = "Repetitive Loss<br><small>properties per block group</small>",
+    opacity = 0.85, group = "FEMA Repetitive Loss (by block group)"
+  ) |>
+
+  # ── Grouped layer control ─────────────────────────────────────────────────
+  addGroupedLayersControl(
+    baseGroups    = c("Light (default)", "OpenStreetMap", "Satellite"),
+    overlayGroups = list(
+      "FEMA Flood Zones"                         = grp_fema,
+      "NOAA Sea Level Rise (passive, MHHW)"      = grp_slr,
+      "MC-FRM 2050 Projections"                  = grp_mcfrm,
+      "SLOSH Hurricane Surge"                    = grp_slosh,
+      "MC-FRM Wave Overtopping Zones (1% event)" = grp_woz,
+      "Social & Equity"                          = grp_equity
+    ),
+    position = "topright",
+    options  = groupedLayersControlOptions(
+      groupsCollapsable = TRUE,
+      groupsCollapsed   = TRUE,
+      collapsed         = FALSE
+    )
+  ) |>
+
+  # ── Map chrome ───────────────────────────────────────────────────────────
+  addScaleBar(position = "bottomleft") |>
+  fitBounds(
+    lng1 = center_lon - view_pad, lat1 = center_lat - view_pad,
+    lng2 = center_lon + view_pad, lat2 = center_lat + view_pad
+  ) |>
+  hideGroup(all_groups) |>
+
+  # ── Exclusive groups via JS: selecting a layer in a group hides the others ──
+  htmlwidgets::onRender("
+    function(el, x) {
+      var map = this;
+
+      var exclusiveGroups = [
+        ['AE Zone (100-yr)', 'VE Zone (coastal wave)', 'X Zone (500-yr)'],
+        ['SLR 1 ft', 'SLR 3 ft', 'SLR 3.5 ft', 'SLR 4 ft', 'SLR 4.5 ft',
+         'SLR 5 ft', 'SLR 5.5 ft', 'SLR 6 ft'],
+        ['2050 Flood Probability', '2050 Inundation Extent (1% event, \u22651m depth)',
+         '2050 Flood Depth (1% annual chance)', '2050 Flood Depth (5% annual chance)'],
+        ['SLOSH Cat 1', 'SLOSH Cat 2', 'SLOSH Cat 3', 'SLOSH Cat 4'],
+        ['Wave Overtopping Zone 2030', 'Wave Overtopping Zone 2050',
+         'Wave Overtopping Zone 2070'],
+        ['CDC SVI', 'FEMA Repetitive Loss (by block group)',
+         'Parcels', 'Vacant Parcels', 'City-Owned Parcels']
+      ];
+
+      // Helper: find a layer object in the control registry by display name
+      function getLayerByName(name) {
+        var ctrl = map.currentLayersControl;
+        if (!ctrl || !ctrl._layers) return null;
+        for (var i = 0; i < ctrl._layers.length; i++) {
+          if (ctrl._layers[i].name === name) return ctrl._layers[i].layer;
+        }
+        return null;
+      }
+
+      map.on('overlayadd', function(e) {
+        var addedName = e.name;
+        exclusiveGroups.forEach(function(group) {
+          if (group.indexOf(addedName) !== -1) {
+            group.forEach(function(layerName) {
+              if (layerName !== addedName) {
+                var layer = getLayerByName(layerName);
+                if (layer && map.hasLayer(layer)) {
+                  map.removeLayer(layer);
+                }
+              }
+            });
+          }
+        });
+      });
+    }
+  ")
+
+htmltools::div(class = "map-wrapper", m)
+```
+
+---
+
+::: {.notes-section}
+
+## Dataset Notes
+
+### Flood Layers (Blues)
+
+**FEMA Flood Zones** — Regulatory flood zones from FEMA's Flood Insurance Rate Map (FIRM), effective January 2026. **AE zones** are the 1% annual chance (100-year) floodplain with computed Base Flood Elevations in feet NAVD88. **VE zones** are coastal high-hazard areas subject to wave action. **X zones** are outside the 500-year floodplain (minimal hazard). These maps do not account for sea level rise; they reflect conditions at the time of the original engineering study.
+
+**NOAA Sea Level Rise** (passive inundation) — Polygons showing areas inundated at 1, 3, 6, and 10 ft of sea level rise above Mean Higher High Water (MHHW). The datum offset matters: Boston Harbor MHHW ≈ 1.5 ft above NAVD88, so "1 ft SLR" here equals roughly 2.5 ft above NAVD88. These represent gradual permanent inundation, not storm surge. Source: NOAA Office for Coastal Management.
+
+**MC-FRM 2050 Projections** — Massachusetts Coast Flood Risk Model by Woods Hole Group / MA EEA. Combines hydrodynamic storm modeling (thousands of simulated storms) with 2050 sea level rise scenarios. Four raster outputs, all continuous-variable with gradients driven by the underlying model data:
+
+- *2050 Flood Probability* — annual probability of any flooding (0–100%). Brighter blue = higher annual flood chance.
+- *2050 Inundation Extent (1% event, ≥1m depth)* — areas with at least 1 meter of water during the 1% annual chance event. Shows both extent and depth (metres).
+- *2050 Flood Depth — 1% annual chance* — continuous depth surface at the 1% annual chance (roughly equivalent to the current "100-year") event.
+- *2050 Flood Depth — 5% annual chance* — continuous depth at the 5% annual chance (roughly the "20-year") event. Covers a wider area with shallower depths.
+
+**SLOSH Hurricane Surge** — NOAA Maximum of the Maximum (MOM) inundation rasters for Category 1–4 hurricanes. Values are worst-case surge depth in feet above ground for each category. Category 5 MOM is not available for New England in this dataset.
+
+**MC-FRM Wave Overtopping Zones** — Areas where coastal flooding is caused by waves breaking over seawalls and dunes rather than direct inundation (Type 9997 in MC-FRM). Shown for 2030, 2050, and 2070 at the 1% annual chance event. Teal shading darkens with time horizon.
+
+---
+
+### Social & Equity Layers
+
+**CDC SVI** — CDC/ATSDR Social Vulnerability Index (2022), census tract level. Overall score 0–1 combines 16 indicators across four themes: socioeconomic status, household characteristics, racial/ethnic minority status, and housing type/transportation access. Higher percentile = greater social vulnerability. Tracts ≥ 75th percentile are considered high vulnerability.
+
+**FEMA Repetitive Loss** — FEMA NFIP properties with 2+ flood insurance claims (Repetitive Loss and Severe Repetitive Loss), shown as a count per census block group. The underlying data does not include precise coordinates (FEMA rounds all addresses to the nearest 0.1 degree for privacy), so block group aggregation is the finest available spatial resolution. Darker amber = more repetitive loss properties.
+
+**Parcels** — MassGIS Level 3 Tax Parcels (gray outlines) showing individual property boundaries from assessor data. Useful for understanding the parcel fabric underlying flood risk.
+
+:::
