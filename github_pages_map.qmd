@@ -248,8 +248,8 @@ m <- leaflet(
   )
 ) |>
 
-  addProviderTiles("CartoDB.Positron",  group = "Light (default)") |>
   addProviderTiles("Esri.WorldImagery", group = "Satellite") |>
+  addProviderTiles("CartoDB.Positron",  group = "Light") |>
 
   addPolygons(
     data        = parcels,
@@ -331,7 +331,7 @@ m <- leaflet(
   ) |>
 
   addLayersControl(
-    baseGroups    = c("Light (default)", "Satellite"),
+    baseGroups    = c("Satellite", "Light"),
     overlayGroups = c("Parcels", "Ownership Type", "Development Districts"),
     position      = "topright",
     options       = layersControlOptions(collapsed = FALSE)
@@ -398,7 +398,7 @@ tagList(
     tags$div(id = "header",
       tags$h1("McKeesport Parcel Map"),
       tags$p(
-        "Hover or click any parcel for ownership, use, assessed value, and sale history. ",
+        "Click any parcel for ownership, use, assessed value, and sale history. ",
         tags$a(
           href   = "https://www.wprdc.org/",
           target = "_blank",
