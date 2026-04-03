@@ -226,6 +226,93 @@ parcels <- parcels |>
   )
 ```
 
+```{r export}
+library(openxlsx)
+
+# ── Select and rename columns for export ──────────────────────────────────────
+col_map <- c(
+  # Unique IDs
+  "PIN"                    = "PIN",
+  "MAPBLOCKLOT"            = "Map_Block_Lot",
+  # Development district (moved to front)
+  "Dist_num"               = "District_Number",
+  "Use_Type"               = "New_Use_Type",
+  # Property address
+  "PROPERTYHOUSENUM"       = "Property_House_Num",
+  "PROPERTYADDRESS"        = "Property_Address",
+  "MUNICODE"               = "Muni_Code",
+  "MUNIDESC"               = "Muni_Desc",
+  "NEIGHDESC"              = "Neighborhood_Desc",
+  # Owner
+  "PROPERTYOWNER"          = "Property_Owner",
+  "own_type"               = "Owner_Type",
+  "CHANGENOTICEADDRESS1"   = "Owner_Mailing_Address_1",
+  "CHANGENOTICEADDRESS2"   = "Owner_Mailing_Address_2",
+  "CHANGENOTICEADDRESS3"   = "Owner_Mailing_Address_3",
+  "CHANGENOTICEADDRESS4"   = "Owner_Mailing_Address_4",
+  # Tax / use
+  "TAXCODE"                = "Tax_Code",
+  "TAXDESC"                = "Tax_Desc",
+  "CLASS"                  = "Class",
+  "CLASSDESC"              = "Class_Desc",
+  "USECODE"                = "Use_Code",
+  "USEDESC"                = "Use_Desc",
+  "HOMESTEADFLAG"          = "Homestead_Flag",
+  # Parcel value
+  "COUNTYLAND"             = "County_Land_Value",
+  "COUNTYBUILDING"         = "County_Building_Value",
+  "COUNTYTOTAL"            = "County_Total_Value",
+  "FAIRMARKETLAND"         = "Fair_Market_Land",
+  "FAIRMARKETBUILDING"     = "Fair_Market_Building",
+  "FAIRMARKETTOTAL"        = "Fair_Market_Total",
+  # Sale history
+  "SALEDATE"               = "Sale_Date",
+  "SALEPRICE"              = "Sale_Price",
+  "SALECODE"               = "Sale_Code",
+  "SALEDESC"               = "Sale_Desc",
+  "PREVSALEDATE"           = "Prev_Sale_Date",
+  "PREVSALEPRICE"          = "Prev_Sale_Price",
+  "PREVSALEDATE2"          = "Prev_Sale_Date_2",
+  "PREVSALEPRICE2"         = "Prev_Sale_Price_2",
+  # Physical
+  "STYLEDESC"              = "Style_Desc",
+  "YEARBLT"                = "Year_Built",
+  "CONDITIONDESC"          = "Condition_Desc",
+  "GRADEDESC"              = "Grade_Desc",
+  "BEDROOMS"               = "Bedrooms",
+  "FULLBATHS"              = "Full_Baths",
+  "HALFBATHS"              = "Half_Baths",
+  "FINISHEDLIVINGAREA"     = "Finished_Living_Area_SqFt",
+  "LOTAREA"                = "Lot_Area_SqFt"
+)
+
+# Only keep source columns that exist in the data
+valid_src <- intersect(names(col_map), names(parcels))
+valid_map <- col_map[valid_src]
+
+export_df <- st_drop_geometry(parcels)[, valid_src] |>
+  rename(!!!setNames(valid_src, valid_map))
+
+export_dist <- export_df |> filter(!is.na(District_Number) & District_Number > 0)
+
+dir.create("output", showWarnings = FALSE)
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Dev District Parcels")
+writeDataTable(wb, "Dev District Parcels", export_dist,
+               tableStyle = "TableStyleMedium2", withFilter = TRUE)
+
+addWorksheet(wb, "All Parcels")
+writeDataTable(wb, "All Parcels", export_df,
+               tableStyle = "TableStyleMedium9", withFilter = TRUE)
+
+setColWidths(wb, "Dev District Parcels", cols = seq_along(valid_map), widths = "auto")
+setColWidths(wb, "All Parcels",          cols = seq_along(valid_map), widths = "auto")
+
+saveWorkbook(wb, "output/mckeesport_parcels.xlsx", overwrite = TRUE)
+```
+
 ```{r map}
 # ── Development district subsets ────────────────────────────────────────────
 dist_parcels <- parcels |> filter(!is.na(Dist_num) & Dist_num > 0)
