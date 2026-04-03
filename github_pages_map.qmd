@@ -258,12 +258,6 @@ m <- leaflet(
     color       = "#555",
     weight      = 0.7,
     opacity     = 0.8,
-    label        = ~lapply(label_html, HTML),
-    labelOptions = labelOptions(
-      style     = list("font-size" = "12px", "max-width" = "300px"),
-      sticky    = FALSE,
-      direction = "auto"
-    ),
     popup        = ~label_html,
     popupOptions = popupOptions(maxWidth = 320, closeOnClick = FALSE),
     group = "Parcels"
@@ -276,12 +270,6 @@ m <- leaflet(
     color       = "#333",
     weight      = 0.7,
     opacity     = 0.8,
-    label        = ~lapply(label_html, HTML),
-    labelOptions = labelOptions(
-      style     = list("font-size" = "12px", "max-width" = "300px"),
-      sticky    = FALSE,
-      direction = "auto"
-    ),
     popup        = ~label_html,
     popupOptions = popupOptions(maxWidth = 320, closeOnClick = FALSE),
     group = "Ownership Type"
@@ -294,12 +282,6 @@ m <- leaflet(
     color       = "#555",
     weight      = 0.7,
     opacity     = 0.8,
-    label        = ~lapply(label_html, HTML),
-    labelOptions = labelOptions(
-      style     = list("font-size" = "12px", "max-width" = "300px"),
-      sticky    = FALSE,
-      direction = "auto"
-    ),
     popup        = ~label_html,
     popupOptions = popupOptions(maxWidth = 320, closeOnClick = FALSE),
     group = "Development Districts"
