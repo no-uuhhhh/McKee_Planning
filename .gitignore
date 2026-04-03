@@ -1,3 +1,6 @@
+# macOS metadata
+.DS_Store
+
 # History files
 .Rhistory
 .Rapp.history
@@ -56,3 +59,5 @@ mckeesport_parcel_map.html
 # Large data folders
 County Assessor Data/
 Parcel_Ownership_Dev_Districts/
+McKee_Dev_Parcels.gdb/
+*.gdb/

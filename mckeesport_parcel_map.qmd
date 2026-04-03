@@ -52,14 +52,13 @@ Interactive parcel lookup for McKeesport, PA. Hover over any parcel to see owner
 ```{r setup}
 library(sf)
 library(dplyr)
-library(readxl)
 library(stringr)
 library(leaflet)
 library(htmltools)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-shp_path   <- "AlleghenyCounty_Parcels/AlleghenyCounty_Parcels202510.shp"
-excel_path <- "County Assessor Data/1_AC Property Assessments_20251001.xlsx"
+gdb_path  <- "McKee_Dev_Parcels.gdb"
+gdb_layer <- "Parcels_Ownership_Dev"
 
 # ── McKeesport center ──────────────────────────────────────────────────────────
 center_lat <- 40.3425
@@ -67,45 +66,14 @@ center_lon <- -79.8491
 ```
 
 ```{r data}
-# Read all McKeesport wards (MUNICODE 401–412) via SQL filter
-parcels_geom <- st_read(
-  shp_path,
-  query = "SELECT * FROM \"AlleghenyCounty_Parcels202510\" WHERE MUNICODE BETWEEN 401 AND 412",
-  quiet = TRUE
-) |>
-  st_transform(4326)
-
-# Read County Assessor Excel — primary source (contains PROPERTYOWNER)
-col_keep <- c(
-  "PARID", "PROPERTYOWNER", "PROPERTYHOUSENUM", "PROPERTYADDRESS",
-  "MUNICODE", "TAXCODE", "TAXDESC", "CLASS", "CLASSDESC", "USECODE", "USEDESC",
-  "LOTAREA", "HOMESTEADFLAG",
-  "SALEDATE", "SALEPRICE", "SALECODE", "SALEDESC",
-  "PREVSALEDATE", "PREVSALEPRICE", "PREVSALEDATE2", "PREVSALEPRICE2",
-  "COUNTYLAND", "COUNTYBUILDING", "COUNTYTOTAL",
-  "FAIRMARKETLAND", "FAIRMARKETBUILDING", "FAIRMARKETTOTAL",
-  "STYLEDESC", "YEARBLT", "CONDITIONDESC", "GRADEDESC",
-  "BEDROOMS", "FULLBATHS", "FINISHEDLIVINGAREA",
-  "DEEDBOOK", "DEEDPAGE", "STYLE"
-)
-
-assessments <- read_xlsx(excel_path) |>
-  select(all_of(col_keep)) |>
-  filter(MUNICODE %in% 401:412) |>
+# Read McKeesport parcels from GeoPackage (already filtered to McKeesport)
+parcels <- st_read(gdb_path, layer = gdb_layer, quiet = TRUE) |>
+  st_zm(drop = TRUE) |>
+  st_transform(4326) |>
   mutate(across(where(is.character), str_trim)) |>
-  rename(PIN = PARID)
-
-# Assign sequential IDs to unassessed polygons before joining
-parcels_geom <- parcels_geom |>
-  mutate(PIN = if_else(
-    PIN == "NOT ASSESSED",
-    sprintf("NA-%04d", cumsum(PIN == "NOT ASSESSED")),
-    PIN
-  ))
-
-# Join geometry + attributes on PIN (left join keeps all geometry rows)
-parcels <- parcels_geom |>
-  left_join(assessments, by = "PIN")
+  mutate(across(where(\(x) inherits(x, "POSIXct") || inherits(x, "Date")),
+                \(x) format(x, "%Y-%m-%d"))) |>
+  mutate(Use_Type = if_else(Use_Type == "Med Desnity", "Med Density", Use_Type))
 ```
 
 ```{r labels}
@@ -178,13 +146,18 @@ classify_owner <- function(owner, taxdesc) {
 
 # Vectorize over all parcels
 parcels <- parcels |>
-  mutate(own_type = mapply(classify_owner, PROPERTYOWNER, TAXDESC)) |>
-  mutate(
-    # Set owner name for unmatched polygons
-    PROPERTYOWNER = if_else(startsWith(PIN, "NA-"), "NOT ASSESSED", PROPERTYOWNER),
-    # Override ownership type for specific parcels
-    own_type      = if_else(PIN == "NA-0010", "City", own_type)
-  )
+  mutate(own_type = mapply(classify_owner, PROPERTYOWNER, TAXDESC))
+
+# ── Color by Use_Type (development districts) ─────────────────────────────────
+use_type_colors <- c(
+  "Low Density"  = "#F5C518",
+  "Med Density"  = "#F0A500",
+  "High Density" = "#A89000",
+  "Planned Unit" = "#E8650A",
+  "Mixed Use"    = "#7BAFD4",
+  "Hotel"        = "#4A7FBF",
+  "CSA"          = "#2E6B1A"
+)
 
 # ── Color by ownership type ────────────────────────────────────────────────────
 own_colors <- c(
@@ -199,11 +172,22 @@ own_colors <- c(
 # ── Build hover label HTML ─────────────────────────────────────────────────────
 parcels <- parcels |>
   mutate(
-    fill_color   = unname(coalesce(own_colors[own_type], "#78909c")),
+    fill_color      = unname(coalesce(own_colors[own_type], "#78909c")),
+    dist_fill_color = unname(coalesce(use_type_colors[Use_Type], "#cccccc")),
     addr_str     = str_trim(paste(
       coalesce(as.character(PROPERTYHOUSENUM), ""),
       coalesce(PROPERTYADDRESS, "")
     )),
+    dist_html = ifelse(
+      !is.na(Dist_num) & Dist_num > 0,
+      paste0(
+        "<hr style='margin:6px 0;border:none;border-top:1px solid #eee'>",
+        "<b>Development District</b><br>",
+        "District #: <b>", Dist_num, "</b><br>",
+        "Use type: ", coalesce(Use_Type, "\u2014")
+      ),
+      ""
+    ),
     label_html = paste0(
       "<div style='font-family:system-ui,sans-serif;font-size:12px;line-height:1.5;",
       "max-width:300px;word-wrap:break-word;overflow-wrap:break-word'>",
@@ -235,12 +219,26 @@ parcels <- parcels |>
       "Prior: ", fmt_date(PREVSALEDATE), " &mdash; ", fmt_dollar(PREVSALEPRICE), "<br>",
       "2nd prior: ", fmt_date(PREVSALEDATE2), " &mdash; ", fmt_dollar(PREVSALEPRICE2),
 
+      dist_html,
+
       "</div>"
     )
   )
 ```
 
 ```{r map}
+# ── Development district subsets ────────────────────────────────────────────
+dist_parcels <- parcels |> filter(!is.na(Dist_num) & Dist_num > 0)
+
+dist_labels <- dist_parcels |>
+  select(Dist_num) |>
+  group_by(Dist_num) |>
+  summarise(.groups = "drop")
+
+dist_coords <- st_coordinates(st_centroid(dist_labels))
+dist_labels$lng <- dist_coords[, 1]
+dist_labels$lat <- dist_coords[, 2]
+
 m <- leaflet(
   options = leafletOptions(
     minZoom   = 13,
@@ -294,7 +292,47 @@ m <- leaflet(
     group = "Ownership Type"
   ) |>
 
-  # ── Legend ──────────────────────────────────────────────────────────────────
+  # ── Development districts: colored parcels ───────────────────────────────────
+  addPolygons(
+    data        = dist_parcels,
+    fillColor   = ~dist_fill_color,
+    fillOpacity = 0.65,
+    color       = "#555",
+    weight      = 0.7,
+    opacity     = 0.8,
+    label        = ~lapply(label_html, HTML),
+    labelOptions = labelOptions(
+      style     = list("font-size" = "12px", "max-width" = "300px"),
+      sticky    = FALSE,
+      direction = "auto"
+    ),
+    popup        = ~label_html,
+    popupOptions = popupOptions(maxWidth = 320, closeOnClick = FALSE),
+    group = "Development Districts"
+  ) |>
+  addLabelOnlyMarkers(
+    data         = dist_labels,
+    lng          = ~lng,
+    lat          = ~lat,
+    label        = ~as.character(Dist_num),
+    labelOptions = labelOptions(
+      noHide    = TRUE,
+      direction = "center",
+      textOnly  = TRUE,
+      style     = list(
+        "font-weight"   = "bold",
+        "font-size"     = "12px",
+        "color"         = "#333",
+        "background"    = "rgba(255,255,255,0.75)",
+        "border"        = "none",
+        "padding"       = "2px 4px",
+        "border-radius" = "3px"
+      )
+    ),
+    group = "Development Districts"
+  ) |>
+
+  # ── Legend: Ownership Type ──────────────────────────────────────────────────
   addLegend(
     position = "bottomright",
     colors   = c("#4a90d9", "#e8890c", "#7b1fa2", "#2e7d32", "#b0bec5", "#78909c"),
@@ -302,18 +340,32 @@ m <- leaflet(
                  "Utilities (PURTA)"),
     title    = "Ownership Type<br><small>faded = tax-exempt</small>",
     opacity  = 0.85,
+    layerId  = "legend-ownership",
     group    = "Ownership Type"
+  ) |>
+
+  # ── Legend: Development Districts ──────────────────────────────────────────
+  addLegend(
+    position = "bottomright",
+    colors   = c("#F5C518", "#F0A500", "#A89000", "#E8650A", "#7BAFD4", "#4A7FBF", "#2E6B1A"),
+    labels   = c("Low Density", "Med Density", "High Density", "Planned Unit",
+                 "Mixed Use", "Hotel", "CSA"),
+    title    = "Development District Use",
+    opacity  = 0.85,
+    layerId  = "legend-districts",
+    group    = "Development Districts"
   ) |>
 
   # ── Layer control ───────────────────────────────────────────────────────────
   addLayersControl(
     baseGroups    = c("Light (default)", "Satellite"),
-    overlayGroups = c("Parcels", "Ownership Type"),
+    overlayGroups = c("Parcels", "Ownership Type", "Development Districts"),
     position      = "topright",
     options       = layersControlOptions(collapsed = FALSE)
   ) |>
 
   hideGroup("Ownership Type") |>
+  hideGroup("Development Districts") |>
 
   addScaleBar(position = "bottomleft") |>
 
@@ -327,19 +379,36 @@ m <- leaflet(
     function(el, x) {
       var map = this;
 
-      // Hide/show legend with Ownership Type layer toggle
+      function legendById(layerId) {
+        return el.querySelector('.leaflet-bottom.leaflet-right [data-layerid=\"' + layerId + '\"]') ||
+               el.querySelector('.leaflet-bottom.leaflet-right .info.legend');
+      }
+
+      // Track legend visibility by layerId
+      var legendIds = {
+        'Ownership Type': 'legend-ownership',
+        'Development Districts': 'legend-districts'
+      };
+
+      // Hide both legends on load (layers start hidden)
+      Object.values(legendIds).forEach(function(lid) {
+        var el2 = document.querySelector('[data-layerid=\"' + lid + '\"]');
+        if (el2) el2.style.display = 'none';
+      });
+
       map.on('overlayremove', function(e) {
-        if (e.name === 'Ownership Type') {
-          el.querySelectorAll('.leaflet-bottom.leaflet-right .info').forEach(function(l) {
-            l.style.display = 'none';
-          });
+        var lid = legendIds[e.name];
+        if (lid) {
+          var el2 = document.querySelector('[data-layerid=\"' + lid + '\"]');
+          if (el2) el2.style.display = 'none';
         }
       });
+
       map.on('overlayadd', function(e) {
-        if (e.name === 'Ownership Type') {
-          el.querySelectorAll('.leaflet-bottom.leaflet-right .info').forEach(function(l) {
-            l.style.display = '';
-          });
+        var lid = legendIds[e.name];
+        if (lid) {
+          var el2 = document.querySelector('[data-layerid=\"' + lid + '\"]');
+          if (el2) el2.style.display = '';
         }
       });
 
